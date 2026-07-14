@@ -126,6 +126,9 @@
   .table-head-row { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; }
   .table-head-row h2 { font-size: 14.5px; margin: 0; font-weight: 700; }
   .muted-sm { color: var(--muted-2); font-weight: 400; font-size: 12px; }
+  .stat-value, table.data th, table.data td, table.detail th, table.detail td {
+    font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
+  }
   table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.data thead th {
     background: #fafbfc; color: var(--muted); font-weight: 600; font-size: 12px;
