@@ -258,7 +258,7 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
   /* ---------- 로컬 저장/불러오기 (파일 모드) ---------- */
   function saveLocal() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify({ months: state.months })); }
-    catch (e) { alert("데이터 저장 실패: " + e.message); }
+    catch (e) { if (window.console) console.warn("로컬 저장 실패(세션에서는 정상 동작): " + e.message); }
   }
   function loadLocal() {
     try {
@@ -289,7 +289,62 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
   }
   function allMonths() { return sortMonths(state.months.concat(state.localMonths)); }
 
-  /* ---------- 파서 (값 기반 · 소계 정합성) ---------- */
+  /* ---------- 파서 디스패처 (양식 자동 판별) ---------- */
+  function endsSummary(v) { return typeof v === "string" && v.replace(/\s+$/, "").endsWith("요약"); }
+  function detectFormat(aoa) {
+    for (var i = 0; i < Math.min(aoa.length, 6); i++) {
+      var row = aoa[i] || [];
+      var joined = row.map(function (c) { return c == null ? "" : String(c); }).join("|");
+      if (/고객명/.test(joined) && /(전범용|구분)/.test(joined)) return { fmt: "B", headerRow: i };
+      if (/주문\s*수량|매출액|주문수량/.test(joined)) return { fmt: "A", headerRow: i };
+    }
+    return { fmt: "A", headerRow: 0 };
+  }
+  function parseAoa(aoa) {
+    var det = detectFormat(aoa);
+    return det.fmt === "B" ? parseSheetB(aoa, det.headerRow) : parseSheet(aoa);
+  }
+
+  /* ---------- 파서 B (피벗/부분합 · 요약행 스킵) ----------
+   * 컬럼: 고객명 | 전범용 구분 | 품목명 | 단위 | 주문수량 | 매출액
+   * 고객명=가맹점 시작(요약이면 총계행), 구분=범용/전용(요약이면 소계행), 품목명 요약=품목 소계 → 스킵
+   */
+  function parseSheetB(aoa, headerRow) {
+    var franchises = {};
+    var cur = null, cat = null;
+    for (var r = (headerRow || 0) + 1; r < aoa.length; r++) {
+      var row = aoa[r] || [];
+      var a = row[0], b = row[1], c = row[2], unit = row[3], q = toNum(row[4]), amt = toNum(row[5]);
+      if (a !== null && a !== undefined && String(a).trim() !== "") {
+        if (endsSummary(a)) { continue; } // 가맹점 총계행
+        cur = String(a).trim(); cat = null;
+        if (!franchises[cur]) franchises[cur] = {
+          total: { qty: 0, amt: 0 },
+          전용: { qty: 0, amt: 0, items: [] },
+          범용: { qty: 0, amt: 0, items: [] }
+        };
+      }
+      if (b !== null && b !== undefined && String(b).trim() !== "") {
+        var sb = String(b).trim();
+        if (endsSummary(b)) { continue; } // 카테고리 소계행
+        if (sb === "범용" || sb === "전용") cat = sb;
+      }
+      if (c !== null && c !== undefined && String(c).trim() !== "") {
+        if (endsSummary(c)) continue; // 품목 소계행
+        if (cur && cat && franchises[cur][cat]) {
+          franchises[cur][cat].qty += q; franchises[cur][cat].amt += amt;
+          franchises[cur][cat].items.push({ name: String(c).trim(), qty: q, amt: amt, unit: unit == null ? "" : String(unit).trim() });
+        }
+      }
+    }
+    Object.keys(franchises).forEach(function (k) {
+      var f = franchises[k];
+      f.total.qty = f.전용.qty + f.범용.qty; f.total.amt = f.전용.amt + f.범용.amt;
+    });
+    return franchises;
+  }
+
+  /* ---------- 파서 A (구 양식 · 3컬럼 계층형 · 소계 정합성) ---------- */
   function parseSheet(aoa) {
     var rows = [];
     for (var r = 0; r < aoa.length; r++) {
@@ -313,7 +368,7 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
         var accq = 0, acca = 0;
         while (i < n && CAT.indexOf(rows[i][0]) === -1) {
           var it = rows[i]; i++;
-          fr[cname].items.push({ name: it[0], qty: it[1], amt: it[2] });
+          fr[cname].items.push({ name: it[0], qty: it[1], amt: it[2], unit: "" });
           accq += it[1]; acca += it[2];
           if (approx(accq, cq) && approx(acca, ca)) break;
         }
@@ -335,12 +390,15 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
   }
   function detectMonth(sheetName, fileName) {
     var m = null, y = null;
-    var src = (sheetName || "") + " " + (fileName || "");
-    var mm = src.match(/(\d{1,2})\s*월/);
-    if (mm) m = parseInt(mm[1], 10);
-    var yy = src.match(/(20\d{2})\s*년?/);
-    if (yy) y = parseInt(yy[1], 10);
-    if (m === null) { var any = src.match(/(\d{1,2})/); if (any) m = parseInt(any[1], 10); }
+    // 파일명을 우선(날짜 정보가 보통 파일명에 있음)
+    var src = (fileName || "") + " " + (sheetName || "");
+    // YYYY.MM / YYYY-MM / YYYY_MM / YYYY MM / YYYYMM (예: 2026.05)
+    var ym = src.match(/(20\d{2})[.\-_/\s]?(0?[1-9]|1[0-2])(?!\d)/);
+    if (ym) { y = parseInt(ym[1], 10); m = parseInt(ym[2], 10); }
+    // N월 (예: 6월)
+    if (m === null) { var mm = src.match(/(\d{1,2})\s*월/); if (mm) m = parseInt(mm[1], 10); }
+    if (y === null) { var yy = src.match(/(20\d{2})\s*년?/); if (yy) y = parseInt(yy[1], 10); }
+    if (m === null) { var any = src.match(/(\d{1,2})\s*월/); if (any) m = parseInt(any[1], 10); }
     return { monthNum: m, year: y };
   }
   function buildMonth(arrayBuffer, fileName, source) {
@@ -348,7 +406,7 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
     var sheetName = wb.SheetNames[0];
     var ws = wb.Sheets[sheetName];
     var aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
-    var franchises = parseSheet(aoa);
+    var franchises = parseAoa(aoa);
     var det = detectMonth(sheetName, fileName);
     var mnum = det.monthNum;
     var key = (det.year ? det.year + "-" : "") + (mnum != null ? ("0" + mnum).slice(-2) : sheetName);
@@ -676,13 +734,16 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
       var detail = "";
       if (f.전용.items.length) {
         var items = f.전용.items.slice().sort(function (a, b) { return b.amt - a.amt; });
+        var hasUnit = items.some(function (it) { return it.unit; });
         var irows = items.map(function (it) {
-          return '<tr><td class="l">' + esc(it.name) + '</td><td class="r">' + num(it.qty) + '</td><td class="r">' + won(it.amt) + '</td></tr>';
+          return '<tr><td class="l">' + esc(it.name) + '</td>' +
+            (hasUnit ? '<td class="c muted">' + esc(it.unit || "") + '</td>' : '') +
+            '<td class="r">' + num(it.qty) + '</td><td class="r">' + won(it.amt) + '</td></tr>';
         }).join("");
         detail = '<tr class="detail-row hidden" id="' + rowId + '"><td colspan="7"><div class="detail-box">' +
           '<div class="detail-title">' + esc(m.label) + ' · 전용품목 상세</div>' +
-          '<table class="detail"><thead><tr><th class="l">품목명</th><th class="r">발주수량</th><th class="r">주문액</th></tr></thead><tbody>' + irows + '</tbody>' +
-          '<tfoot><tr><td class="l">전용 합계</td><td class="r">' + num(f.전용.qty) + '</td><td class="r">' + won(f.전용.amt) + '</td></tr></tfoot></table></div></td></tr>';
+          '<table class="detail"><thead><tr><th class="l">품목명</th>' + (hasUnit ? '<th class="c">단위</th>' : '') + '<th class="r">발주수량</th><th class="r">주문액</th></tr></thead><tbody>' + irows + '</tbody>' +
+          '<tfoot><tr><td class="l"' + (hasUnit ? ' colspan="2"' : '') + '>전용 합계</td><td class="r">' + num(f.전용.qty) + '</td><td class="r">' + won(f.전용.amt) + '</td></tr></tfoot></table></div></td></tr>';
       }
       return main + detail;
     }).join("");
@@ -729,8 +790,8 @@ t.sheetStubs=true}if(t.type=="array"){t.type="binary";var a=xk(e,t);t.type="arra
     perMonth.forEach(function (p) {
       if (!p.f || !p.f.전용.items.length) return;
       aoa.push([p.month.label + " · 전용품목 상세"]);
-      aoa.push(["품목명", "발주수량", "주문액"]);
-      p.f.전용.items.slice().sort(function (a, b) { return b.amt - a.amt; }).forEach(function (it) { aoa.push([it.name, it.qty, it.amt]); });
+      aoa.push(["품목명", "단위", "발주수량", "주문액"]);
+      p.f.전용.items.slice().sort(function (a, b) { return b.amt - a.amt; }).forEach(function (it) { aoa.push([it.name, it.unit || "", it.qty, it.amt]); });
       aoa.push([]);
     });
     downloadSheet(aoa, name.replace(/[^\w가-힣]/g, "_") + "_월별주문.xlsx", "월별주문");
